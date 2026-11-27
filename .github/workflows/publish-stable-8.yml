@@ -43,10 +43,15 @@ jobs:
           printf '%s  %s\n' "$EXPECTED_SHA" "$APK" | diff - SHA256SUMS.txt
           sha256sum -c SHA256SUMS.txt
           gh release view "$TAG" --json body --jq .body > release-notes.md
-          build_tools="$(find "$ANDROID_HOME/build-tools" -mindepth 1 -maxdepth 1 -type d | sort -V | tail -1)"
+          build_tools="$ANDROID_HOME/build-tools/36.0.0"
+          test -x "$build_tools/aapt"
+          export JAVA_HOME="${JAVA_HOME_17_X64:?}"
+          export PATH="$JAVA_HOME/bin:$PATH"
           "$build_tools/apksigner" verify --print-certs "$APK" > cert.txt
+          grep "certificate SHA-256 digest:" cert.txt
           test "$(sed -n 's/^Signer #[0-9]* certificate SHA-256 digest: //p' cert.txt)" = "$CERT"
           "$build_tools/aapt" dump badging "$APK" > badging.txt
+          grep -E "^(package:|application-label:|sdkVersion:)" badging.txt
           grep -q "^package: name='com.example.moochie_streamer' versionCode='8' versionName='1.0.9'" badging.txt
           grep -Fxq "application-label:'Moochie Streams'" badging.txt
           grep -Fxq "sdkVersion:'24'" badging.txt
