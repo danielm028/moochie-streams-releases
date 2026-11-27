@@ -1,0 +1,132 @@
+name: Publish Moochie Streams preview to stable migration
+
+on:
+  workflow_dispatch:
+    inputs:
+      apk_sha256:
+        description: SHA-256 of the reviewed production APK
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+concurrency:
+  group: moochie-production-publication
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    if: github.repository == 'danielm028/moochie-streams-releases' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: danielm028/moochie-streams-releases
+      EXPECTED_SHA: ${{ inputs.apk_sha256 }}
+      APK: moochie-streams-stable-8.apk
+      TAG: ota-preview-8
+      APK_URL: https://github.com/danielm028/moochie-streams-releases/releases/download/ota-preview-8/moochie-streams-stable-8.apk
+      MANIFEST_URL: https://raw.githubusercontent.com/danielm028/moochie-streams-releases/main/updates/ota-preview.json
+      CERT: bb4e5b68332e105a8777929ecc032d7916695fe0f2d4a29594c2d040a74f59a1
+      PUBLIC_PIN: MCowBQYDK2VwAyEA4pPjIg1V9wVp8dOwNIHEZuBDPJW4XfsDXn3Ng11ZNIA=
+      STABLE_MANIFEST_BLOB: 243739414442f7023d42da76cba849fb4a397681
+      PREVIOUS_MANIFEST_BLOB: af24fe48cdbadf75f43751dc3d0350b4ca1cb5
+    steps:
+      - name: Verify draft and review baseline
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$EXPECTED_SHA" = d04c84265fd48fe32212dd1cf1fd3ccae05d70a8269e71d904f9fdb7959cade6
+          test "$(gh api "repos/$GH_REPO/contents/updates/stable.json" --jq .sha)" = "$STABLE_MANIFEST_BLOB"
+          test "$(gh release view "$TAG" --json isDraft --jq .isDraft)" = true
+          test "$(gh api "repos/$GH_REPO/contents/updates/ota-preview.json" --jq .sha)" = "$PREVIOUS_MANIFEST_BLOB"
+          gh release download "$TAG" -p "$APK" -p SHA256SUMS.txt
+          printf '%s  %s\n' "$EXPECTED_SHA" "$APK" | diff - SHA256SUMS.txt
+          sha256sum -c SHA256SUMS.txt
+          gh release view "$TAG" --json body --jq .body > release-notes.md
+          build_tools="$ANDROID_HOME/build-tools/36.0.0"
+          test -x "$build_tools/aapt"
+          export JAVA_HOME="${JAVA_HOME_17_X64:?}"
+          export PATH="$JAVA_HOME/bin:$PATH"
+          "$build_tools/apksigner" verify --print-certs "$APK" > cert.txt
+          grep "certificate SHA-256 digest:" cert.txt
+          test "$(sed -n 's/^Signer #[0-9]* certificate SHA-256 digest: //p' cert.txt)" = "$CERT"
+          "$build_tools/aapt" dump badging "$APK" > badging.txt
+          grep -E "^(package:|application-label:|sdkVersion:)" badging.txt
+          grep -q "^package: name='com.example.moochie_streamer' versionCode='8' versionName='1.0.9'" badging.txt
+          grep -Fxq "application-label:'Moochie Streams'" badging.txt
+          grep -Fxq "sdkVersion:'24'" badging.txt
+          if grep -q application-debuggable badging.txt; then exit 1; fi
+          "$build_tools/aapt" dump --values resources "$APK" > resources.txt
+          grep -A1 ':string/update_stable_key:' resources.txt | grep -F "$PUBLIC_PIN"
+          grep -A1 ':bool/update_ota_preview:' resources.txt | grep -F '(boolean) false'
+
+      - name: Sign production manifest
+        env:
+          PRODUCTION_KEY: ${{ secrets.PRODUCTION_OTA_ED25519_PRIVATE_KEY_PEM_B64 }}
+        shell: bash
+        run: |
+          node <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const assert = require('node:assert/strict');
+          const key = crypto.createPrivateKey(Buffer.from(process.env.PRODUCTION_KEY, 'base64'));
+          const publicKey = crypto.createPublicKey(key);
+          assert.equal(key.asymmetricKeyType, 'ed25519');
+          assert.equal(publicKey.export({ type: 'spki', format: 'der' }).toString('base64'), process.env.PUBLIC_PIN);
+          const releaseNotes = fs.readFileSync('release-notes.md', 'utf8').trim();
+          assert(releaseNotes.length > 0 && releaseNotes.length <= 12000);
+          const payload = Buffer.from(JSON.stringify({
+            schemaVersion: 1, channel: 'ota-preview', packageId: 'com.example.moochie_streamer',
+            versionCode: 8, versionName: '1.0.9', apkUrl: process.env.APK_URL,
+            apkSha256: process.env.EXPECTED_SHA, apkSizeBytes: fs.statSync(process.env.APK).size,
+            releaseNotes, minAndroidSdk: 24, signingCertificateSha256: process.env.CERT,
+            publishedAt: new Date().toISOString().replace(/\.\d{3}Z$/, 'Z')
+          }));
+          const signature = crypto.sign(null, payload, key);
+          assert(crypto.verify(null, payload, publicKey, signature));
+          const envelope = JSON.stringify({payload: payload.toString('base64'), signature: signature.toString('base64')}, null, 2) + '\n';
+          assert(Buffer.byteLength(envelope) < 65536);
+          fs.writeFileSync('stable.json', envelope);
+          NODE
+
+      - name: Publish and verify anonymous APK download
+        shell: bash
+        run: |
+          gh release edit "$TAG" --draft=false --prerelease --latest=false
+          curl --fail --silent --show-error --location --retry 6 --retry-all-errors "$APK_URL" -o public.apk
+          printf '%s  %s\n' "$EXPECTED_SHA" public.apk | sha256sum -c -
+          cmp "$APK" public.apk
+
+      - name: Publish only the migration manifest and verify the public signature
+        shell: bash
+        run: |
+          test "$(gh api "repos/$GH_REPO/contents/updates/ota-preview.json" --jq .sha)" = "$PREVIOUS_MANIFEST_BLOB"
+          gh api --method PUT "repos/$GH_REPO/contents/updates/ota-preview.json" \
+            -f message="Publish Moochie Streams preview to stable migration OTA" \
+            -f branch=main -f sha="$PREVIOUS_MANIFEST_BLOB" \
+            -f content="$(base64 -w0 stable.json)" --jq .commit.sha
+          test "$(gh api "repos/$GH_REPO/contents/updates/stable.json" --jq .sha)" = "$STABLE_MANIFEST_BLOB"
+          for attempt in {1..12}; do
+            if curl -fsSL -H 'Cache-Control: no-cache' "$MANIFEST_URL?verify=$GITHUB_RUN_ID-$attempt" -o public.json && cmp -s stable.json public.json; then
+              break
+            fi
+            sleep 5
+          done
+          cmp stable.json public.json
+          node <<'NODE'
+          const fs = require('node:fs');
+          const crypto = require('node:crypto');
+          const assert = require('node:assert/strict');
+          const envelope = JSON.parse(fs.readFileSync('public.json'));
+          const payload = Buffer.from(envelope.payload, 'base64');
+          const key = crypto.createPublicKey({key: Buffer.from(process.env.PUBLIC_PIN, 'base64'), format: 'der', type: 'spki'});
+          assert(crypto.verify(null, payload, key, Buffer.from(envelope.signature, 'base64')));
+          const manifest = JSON.parse(payload);
+          assert.equal(manifest.apkUrl, process.env.APK_URL);
+          assert.equal(manifest.apkSha256, process.env.EXPECTED_SHA);
+          assert.equal(manifest.versionCode, 8);
+          assert.equal(manifest.channel, 'ota-preview');
+          console.log('Public stable Ed25519 signature, APK hash and channel verified.');
+          NODE
